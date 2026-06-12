@@ -24532,7 +24532,6 @@ async function getCommitFiles(hash) {
   await exec("git", ["show", "--name-only", "--format=", hash], {
     listeners: { stdout: (data) => output += data.toString() },
     silent: true
-    // Keep logs clean
   });
   return output.trim().split("\n").filter(Boolean);
 }
@@ -24547,15 +24546,15 @@ async function getConflictedFiles() {
 }
 async function run() {
   try {
-    const prefixKeys = getInput("prefix-keys").split(",").map((k) => k.trim()).filter(Boolean);
-    const suffixKeys = getInput("suffix-keys").split(",").map((k) => k.trim()).filter(Boolean);
-    const regexKeys = getInput("regex-keys").split(",").map((k) => k.trim()).filter(Boolean);
+    let prefixKeys = getInput("prefix-keys").split(",").map((k) => k.trim()).filter(Boolean);
+    let suffixKeys = getInput("suffix-keys").split(",").map((k) => k.trim()).filter(Boolean);
+    let regexKeys = getInput("regex-keys").split(",").map((k) => k.trim()).filter(Boolean);
     const sourceBranch = getInput("source-branch");
     const targetBranch = getInput("target-branch");
     const token = getInput("github-token");
     const testWorkflowId = getInput("test-workflow-id");
     if (prefixKeys.length === 0 && suffixKeys.length === 0 && regexKeys.length === 0) {
-      throw new Error("You must provide at least one matching condition: prefix-keys, suffix-keys, or regex-keys.");
+      throw new Error("You must provide at least one matching condition.");
     }
     const octokit = getOctokit(token);
     const { owner, repo } = context2.repo;
@@ -24581,96 +24580,110 @@ async function run() {
     });
     const runUuid = crypto2.randomUUID();
     const candidateBranch = `candidate/${runUuid}`;
-    await exec("git", ["checkout", "-b", candidateBranch, `origin/${targetBranch}`]);
-    const summary2 = {
-      applied: [],
-      skipped: [],
-      conflicts: [],
-      testFailures: []
-    };
-    let hasPendingChangesToTest = false;
-    for (const commit of commits) {
-      let isMatch = false;
-      if (prefixKeys.length > 0) isMatch = isMatch || prefixKeys.some((prefix) => commit.msg.startsWith(prefix));
-      if (!isMatch && suffixKeys.length > 0) isMatch = isMatch || suffixKeys.some((suffix) => commit.msg.endsWith(suffix));
-      if (!isMatch && regexKeys.length > 0) {
-        isMatch = isMatch || regexKeys.some((regexStr) => {
+    const finalConflicts = [];
+    let finalSummary;
+    let retryPipeline = true;
+    while (retryPipeline) {
+      retryPipeline = false;
+      let hasPendingChangesToTest = false;
+      info("========================================");
+      info(`Starting Pipeline Build. Active Prefixes: [${prefixKeys.join(", ")}]`);
+      info("========================================");
+      await exec("git", ["checkout", `origin/${targetBranch}`]);
+      try {
+        await exec("git", ["branch", "-D", candidateBranch], { silent: true });
+      } catch (e) {
+      }
+      await exec("git", ["checkout", "-b", candidateBranch, `origin/${targetBranch}`]);
+      const summary2 = { applied: [], skipped: [], testFailures: [] };
+      for (const commit of commits) {
+        const matchedPrefixes = prefixKeys.filter((p) => commit.msg.startsWith(p));
+        const matchedSuffixes = suffixKeys.filter((s) => commit.msg.endsWith(s));
+        const matchedRegexes = regexKeys.filter((r) => {
           try {
-            return new RegExp(regexStr).test(commit.msg);
+            return new RegExp(r).test(commit.msg);
           } catch (e) {
             return false;
           }
         });
-      }
-      if (isMatch) {
-        info(`Applying commit: ${commit.shortHash} (${commit.msg})`);
-        const cherryPickOptions = { env: { ...process.env, GIT_COMMITTER_DATE: commit.date } };
-        try {
-          await exec("git", ["cherry-pick", commit.hash], cherryPickOptions);
-          summary2.applied.push(commit);
-          hasPendingChangesToTest = true;
-        } catch (error2) {
-          warning(`Merge conflict on ${commit.shortHash}. Analyzing dependencies...`);
-          const conflictedFiles = await getConflictedFiles();
-          await exec("git", ["cherry-pick", "--abort"]);
-          const potentialFixes = [];
-          for (const skipped of summary2.skipped) {
-            const intersection = skipped.files.filter((f) => conflictedFiles.includes(f));
-            if (intersection.length > 0) {
-              potentialFixes.push({
-                ...skipped,
-                intersectingFiles: intersection
-              });
+        const isMatch = matchedPrefixes.length > 0 || matchedSuffixes.length > 0 || matchedRegexes.length > 0;
+        if (isMatch) {
+          info(`Applying commit: ${commit.shortHash} (${commit.msg})`);
+          const cherryPickOptions = { env: { ...process.env, GIT_COMMITTER_DATE: commit.date } };
+          try {
+            await exec("git", ["cherry-pick", commit.hash], cherryPickOptions);
+            summary2.applied.push(commit);
+            hasPendingChangesToTest = true;
+          } catch (error2) {
+            warning(`\u{1F6A8} Merge conflict on ${commit.shortHash}. Analyzing dependencies and pruning keys...`);
+            const conflictedFiles = await getConflictedFiles();
+            await exec("git", ["cherry-pick", "--abort"]);
+            const potentialFixes = [];
+            for (const skipped of summary2.skipped) {
+              const intersection = skipped.files.filter((f) => conflictedFiles.includes(f));
+              if (intersection.length > 0) potentialFixes.push({ ...skipped, intersectingFiles: intersection });
             }
+            const droppedKeys = [...matchedPrefixes, ...matchedSuffixes, ...matchedRegexes];
+            finalConflicts.push({
+              ...commit,
+              files: conflictedFiles,
+              potentialFixes,
+              droppedKeys
+              // Save the pruned keys for the HTML report
+            });
+            prefixKeys = prefixKeys.filter((k) => !matchedPrefixes.includes(k));
+            suffixKeys = suffixKeys.filter((k) => !matchedSuffixes.includes(k));
+            regexKeys = regexKeys.filter((k) => !matchedRegexes.includes(k));
+            info(`\u274C Dropped keys: [${droppedKeys.join(", ")}]. Wiping branch and restarting pipeline...`);
+            retryPipeline = true;
+            break;
           }
-          summary2.conflicts.push({
-            ...commit,
-            files: conflictedFiles,
-            potentialFixes
-          });
-        }
-      } else {
-        info(`Skipping commit: ${commit.shortHash} (${commit.msg})`);
-        const files = await getCommitFiles(commit.hash);
-        summary2.skipped.push({ ...commit, files });
-        if (hasPendingChangesToTest && testWorkflowId) {
-          let testPassed = false;
-          startGroup(`Automated Validation Loop for pending commits`);
-          while (!testPassed && summary2.applied.length > 0) {
-            const tmpBranch = `build/tmp/${runUuid}`;
-            await exec("git", ["checkout", "-B", tmpBranch]);
-            await exec("git", ["push", "-u", "origin", tmpBranch, "--force"]);
-            let success = false;
-            if (testWorkflowId.endsWith(".yml") || testWorkflowId.endsWith(".yaml")) {
-              await octokit.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: testWorkflowId, ref: tmpBranch });
-              success = await pollWorkflowRun(octokit, owner, repo, testWorkflowId, tmpBranch);
-            } else {
-              try {
-                await exec(testWorkflowId);
-                success = true;
-              } catch {
-                success = false;
+        } else {
+          info(`Skipping commit: ${commit.shortHash} (${commit.msg})`);
+          const files = await getCommitFiles(commit.hash);
+          summary2.skipped.push({ ...commit, files });
+          if (hasPendingChangesToTest && testWorkflowId) {
+            let testPassed = false;
+            startGroup(`Automated Validation Loop`);
+            while (!testPassed && summary2.applied.length > 0) {
+              const tmpBranch = `build/tmp/${runUuid}`;
+              await exec("git", ["checkout", "-B", tmpBranch]);
+              await exec("git", ["push", "-u", "origin", tmpBranch, "--force"]);
+              let success = false;
+              if (testWorkflowId.endsWith(".yml") || testWorkflowId.endsWith(".yaml")) {
+                await octokit.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: testWorkflowId, ref: tmpBranch });
+                success = await pollWorkflowRun(octokit, owner, repo, testWorkflowId, tmpBranch);
+              } else {
+                try {
+                  await exec(testWorkflowId);
+                  success = true;
+                } catch {
+                  success = false;
+                }
+              }
+              await exec("git", ["checkout", candidateBranch]);
+              if (success) {
+                testPassed = true;
+                hasPendingChangesToTest = false;
+              } else {
+                const droppedCommit = summary2.applied.pop();
+                summary2.testFailures.push(droppedCommit);
+                await exec("git", ["reset", "--hard", "HEAD~1"]);
               }
             }
-            await exec("git", ["checkout", candidateBranch]);
-            if (success) {
-              testPassed = true;
-              hasPendingChangesToTest = false;
-            } else {
-              const droppedCommit = summary2.applied.pop();
-              summary2.testFailures.push(droppedCommit);
-              await exec("git", ["reset", "--hard", "HEAD~1"]);
-            }
+            endGroup();
+          } else if (!testWorkflowId) {
+            hasPendingChangesToTest = false;
           }
-          endGroup();
-        } else if (!testWorkflowId) {
-          hasPendingChangesToTest = false;
         }
+      }
+      if (!retryPipeline) {
+        finalSummary = summary2;
       }
     }
     await exec("git", ["push", "-u", "origin", candidateBranch]);
     setOutput("candidate-branch", candidateBranch);
-    await publishSummary(summary2, candidateBranch, runUuid, testWorkflowId);
+    await publishSummary(finalSummary, finalConflicts, candidateBranch, runUuid, testWorkflowId);
   } catch (error2) {
     setFailed(error2.message);
   }
@@ -24688,18 +24701,20 @@ async function pollWorkflowRun(octokit, owner, repo, workflowId, branch) {
     await new Promise((r) => setTimeout(r, pollDelay));
   }
 }
-async function publishSummary(summary2, candidateBranch, runUuid, testWorkflowId) {
+async function publishSummary(summary2, conflicts, candidateBranch, runUuid, testWorkflowId) {
   const testingStatus = testWorkflowId ? "" : " <i>(Testing Disabled)</i>";
   const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
   const repository = process.env.GITHUB_REPOSITORY;
   const commitBaseUrl = `${serverUrl}/${repository}/commit`;
   const mapCommitList = (arr) => arr.length > 0 ? arr.map((c) => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</li>`).join("") : '<li class="empty">None</li>';
-  const generateConflictGraph = (conflicts) => {
-    if (conflicts.length === 0) return '<p class="empty" style="margin-left: 40px;">None</p>';
-    return conflicts.map((c) => `
+  const generateConflictGraph = (conflictsArray) => {
+    if (conflictsArray.length === 0) return '<p class="empty" style="margin-left: 40px;">None</p>';
+    return conflictsArray.map((c) => `
             <div class="conflict-card">
                 <div class="commit-header">
-                    <strong>\u{1F6A8} Conflict on: <a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a></strong> ${c.msg}
+                    <strong>\u{1F6A8} Pipeline Reset - Bad Keys Pruned: <code>[${c.droppedKeys.join(", ")}]</code></strong>
+                    <br>
+                    <small>Conflict on: <a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</small>
                 </div>
                 <div class="conflict-body">
                     <div class="files-column">
@@ -24735,12 +24750,10 @@ async function publishSummary(summary2, candidateBranch, runUuid, testWorkflowId
                 li { margin-bottom: 5px; font-family: monospace; font-size: 14px; }
                 .empty { color: #586069; font-style: italic; list-style-type: none; }
                 
-                /* Link Styles */
                 a.commit-link { text-decoration: none; }
                 a.commit-link code { color: #0366d6; cursor: pointer; }
                 a.commit-link:hover code { text-decoration: underline; color: #005cc5; }
                 
-                /* Conflict Graph Styles */
                 .conflict-card { border: 1px solid #d73a49; border-radius: 6px; margin: 15px 0 15px 40px; overflow: hidden; }
                 .commit-header { background: #ffeef0; padding: 10px 15px; border-bottom: 1px solid #d73a49; color: #b31d28; font-family: monospace;}
                 .commit-header a.commit-link code { color: #b31d28; text-decoration: underline; }
@@ -24764,8 +24777,8 @@ async function publishSummary(summary2, candidateBranch, runUuid, testWorkflowId
             <h3>\u23ED\uFE0F Skipped Commits</h3>
             <ul>${mapCommitList(summary2.skipped)}</ul>
             
-            <h3>\u26A0\uFE0F Dropped due to Merge Conflicts</h3>
-            ${generateConflictGraph(summary2.conflicts)}
+            <h3>\u26A0\uFE0F Invalidated Tickets (Merge Conflicts)</h3>
+            ${generateConflictGraph(conflicts)}
             
             <h3>\u274C Dropped due to Failed Validation Tests${testingStatus}</h3>
             <ul>${mapCommitList(summary2.testFailures)}</ul>
