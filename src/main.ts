@@ -307,17 +307,37 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
         </body>
     </html>`;
 
-    fs.writeFileSync('index.html', html);
+    // --- NEW: Bulletproof Remote Check ---
+    let lsRemoteOutput = '';
+    await exec.exec('git', ['ls-remote', '--heads', 'origin', 'gh-pages'], {
+        listeners: { stdout: (data: Buffer) => lsRemoteOutput += data.toString() },
+        silent: true
+    });
 
-    try { await exec.exec('git', ['checkout', 'gh-pages']); } 
-    catch {
+    const hasRemoteGhPages = lsRemoteOutput.trim().length > 0;
+
+    if (hasRemoteGhPages) {
+        core.info('Remote gh-pages branch found. Syncing...');
+        await exec.exec('git', ['fetch', 'origin', 'gh-pages']);
+        
+        // Force delete local gh-pages if it accidentally exists to avoid checkout crashes
+        try { await exec.exec('git', ['branch', '-D', 'gh-pages'], { silent: true }); } catch (e) {}
+        
+        await exec.exec('git', ['checkout', '-b', 'gh-pages', 'origin/gh-pages']);
+    } else {
+        core.info('Remote gh-pages branch not found. Creating a new orphan branch...');
         await exec.exec('git', ['checkout', '--orphan', 'gh-pages']);
         await exec.exec('git', ['rm', '-rf', '.']);
     }
-    
+
+    // Write the files ONLY AFTER we are safely on the gh-pages branch
+    fs.writeFileSync('index.html', html);
     fs.writeFileSync(`report-${runUuid}.html`, html);
-    fs.copyFileSync(`report-${runUuid}.html`, 'index.html');
+    
     await exec.exec('git', ['add', `report-${runUuid}.html`, 'index.html']);
     await exec.exec('git', ['commit', '-m', `Add automation report for ${candidateBranch}`]);
     await exec.exec('git', ['push', 'origin', 'gh-pages']);
+
+    // Return the workspace back to the candidate branch
+    await exec.exec('git', ['checkout', candidateBranch]);
 }

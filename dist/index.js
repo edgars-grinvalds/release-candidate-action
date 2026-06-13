@@ -24784,18 +24784,31 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
             <ul>${mapCommitList(summary2.testFailures)}</ul>
         </body>
     </html>`;
-  fs3.writeFileSync("index.html", html);
-  try {
-    await exec("git", ["checkout", "gh-pages"]);
-  } catch {
+  let lsRemoteOutput = "";
+  await exec("git", ["ls-remote", "--heads", "origin", "gh-pages"], {
+    listeners: { stdout: (data) => lsRemoteOutput += data.toString() },
+    silent: true
+  });
+  const hasRemoteGhPages = lsRemoteOutput.trim().length > 0;
+  if (hasRemoteGhPages) {
+    info("Remote gh-pages branch found. Syncing...");
+    await exec("git", ["fetch", "origin", "gh-pages"]);
+    try {
+      await exec("git", ["branch", "-D", "gh-pages"], { silent: true });
+    } catch (e) {
+    }
+    await exec("git", ["checkout", "-b", "gh-pages", "origin/gh-pages"]);
+  } else {
+    info("Remote gh-pages branch not found. Creating a new orphan branch...");
     await exec("git", ["checkout", "--orphan", "gh-pages"]);
     await exec("git", ["rm", "-rf", "."]);
   }
+  fs3.writeFileSync("index.html", html);
   fs3.writeFileSync(`report-${runUuid}.html`, html);
-  fs3.copyFileSync(`report-${runUuid}.html`, "index.html");
   await exec("git", ["add", `report-${runUuid}.html`, "index.html"]);
   await exec("git", ["commit", "-m", `Add automation report for ${candidateBranch}`]);
   await exec("git", ["push", "origin", "gh-pages"]);
+  await exec("git", ["checkout", candidateBranch]);
 }
 
 // src/index.ts
