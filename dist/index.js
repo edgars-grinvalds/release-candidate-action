@@ -24570,16 +24570,18 @@ async function run() {
     });
     mergeBase = mergeBase.trim();
     let logOutput = "";
-    await exec("git", ["log", "--reverse", "--format=%H|%cD|%s", `${mergeBase}..origin/${sourceBranch}`], {
+    await exec("git", ["log", "--reverse", "--format=%H|%cn|%ce|%cI|%s", `${mergeBase}..origin/${sourceBranch}`], {
       listeners: { stdout: (data) => logOutput += data.toString() }
     });
     const commits = logOutput.trim().split("\n").filter(Boolean).map((line) => {
       const parts = line.split("|");
       const hash = parts.shift();
-      const date = parts.shift();
+      const cName = parts.shift();
+      const cEmail = parts.shift();
+      const cDate = parts.shift();
       const msg = parts.join("|");
       const shortHash = hash.substring(0, 7).toUpperCase();
-      return { hash, shortHash, date, msg };
+      return { hash, shortHash, cName, cEmail, cDate, msg };
     });
     const runUuid = crypto2.randomUUID();
     const candidateBranch = `candidate/${runUuid}`;
@@ -24612,7 +24614,14 @@ async function run() {
         const isMatch = matchedPrefixes.length > 0 || matchedSuffixes.length > 0 || matchedRegexes.length > 0;
         if (isMatch) {
           info(`Applying commit: ${commit.shortHash} (${commit.msg})`);
-          const cherryPickOptions = { env: { ...process.env, GIT_COMMITTER_DATE: commit.date } };
+          const cherryPickOptions = {
+            env: {
+              ...process.env,
+              GIT_COMMITTER_NAME: commit.cName,
+              GIT_COMMITTER_EMAIL: commit.cEmail,
+              GIT_COMMITTER_DATE: commit.cDate
+            }
+          };
           try {
             await exec("git", ["cherry-pick", commit.hash], cherryPickOptions);
             summary2.applied.push(commit);
@@ -24635,7 +24644,6 @@ async function run() {
                   ...skipped,
                   intersectingFiles: intersection,
                   otherFiles: others
-                  // Saving non-intersecting files for the toggle UI
                 });
               }
             }
@@ -24807,13 +24815,11 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 a.file-link { text-decoration: none; color: #24292e; transition: color 0.2s; }
                 a.file-link:hover { text-decoration: underline; color: #0366d6; }
                 
-                /* Badges Styling */
                 .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; vertical-align: middle; font-family: -apple-system, sans-serif; }
                 .badge-ignored { background: #e1e4e8; color: #586069; }
                 .badge-conflict { background: #ffdce0; color: #b31d28; }
                 .badge-failed { background: #fff5b1; color: #b08800; }
                 
-                /* HTML Details element tweaks */
                 details summary { outline: none; transition: color 0.2s; }
                 details summary:hover { color: #005cc5; }
 

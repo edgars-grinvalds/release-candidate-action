@@ -29,7 +29,6 @@ export async function run(): Promise<void> {
         let suffixKeys = core.getInput('suffix-keys').split(',').map(k => k.trim()).filter(Boolean);
         let regexKeys = core.getInput('regex-keys').split(',').map(k => k.trim()).filter(Boolean);
         
-        // Save the original inputs so we can tag pruned commits later
         const initialPrefixKeys = [...prefixKeys];
         const initialSuffixKeys = [...suffixKeys];
         const initialRegexKeys = [...regexKeys];
@@ -46,6 +45,7 @@ export async function run(): Promise<void> {
         const octokit = github.getOctokit(token);
         const { owner, repo } = github.context.repo;
 
+        // Fallback bot config (only used for UI branch commits like the report or conflict-data)
         await exec.exec('git', ['config', 'user.name', 'github-actions[bot]']);
         await exec.exec('git', ['config', 'user.email', 'github-actions[bot]@users.noreply.github.com']);
         await exec.exec('git', ['fetch', '--all']);
@@ -57,17 +57,21 @@ export async function run(): Promise<void> {
         mergeBase = mergeBase.trim();
 
         let logOutput = '';
-        await exec.exec('git', ['log', '--reverse', '--format=%H|%cD|%s', `${mergeBase}..origin/${sourceBranch}`], {
+        
+        // 1. UPDATED LOG FORMAT: Extract exact Committer Name (%cn), Email (%ce), and ISO Date (%cI)
+        await exec.exec('git', ['log', '--reverse', '--format=%H|%cn|%ce|%cI|%s', `${mergeBase}..origin/${sourceBranch}`], {
             listeners: { stdout: (data: Buffer) => logOutput += data.toString() }
         });
         
         const commits = logOutput.trim().split('\n').filter(Boolean).map(line => {
             const parts = line.split('|');
             const hash = parts.shift()!;
-            const date = parts.shift()!;
+            const cName = parts.shift()!;
+            const cEmail = parts.shift()!;
+            const cDate = parts.shift()!;
             const msg = parts.join('|');
-            const shortHash = hash.substring(0, 7).toUpperCase(); // UPPERCASE REQUESTED
-            return { hash, shortHash, date, msg };
+            const shortHash = hash.substring(0, 7).toUpperCase(); 
+            return { hash, shortHash, cName, cEmail, cDate, msg };
         });
 
         const runUuid = crypto.randomUUID();
@@ -103,7 +107,16 @@ export async function run(): Promise<void> {
 
                 if (isMatch) {
                     core.info(`Applying commit: ${commit.shortHash} (${commit.msg})`);
-                    const cherryPickOptions = { env: { ...process.env, GIT_COMMITTER_DATE: commit.date } };
+                    
+                    // 2. SPOOF COMMITTER: Inject the original committer's exact data to prevent changes
+                    const cherryPickOptions = { 
+                        env: { 
+                            ...process.env, 
+                            GIT_COMMITTER_NAME: commit.cName,
+                            GIT_COMMITTER_EMAIL: commit.cEmail,
+                            GIT_COMMITTER_DATE: commit.cDate
+                        } 
+                    };
 
                     try {
                         await exec.exec('git', ['cherry-pick', commit.hash], cherryPickOptions);
@@ -130,7 +143,7 @@ export async function run(): Promise<void> {
                                 potentialFixes.push({
                                     ...skipped, 
                                     intersectingFiles: intersection,
-                                    otherFiles: others // Saving non-intersecting files for the toggle UI
+                                    otherFiles: others
                                 });
                             }
                         }
@@ -158,7 +171,6 @@ export async function run(): Promise<void> {
                     core.info(`Skipping commit: ${commit.shortHash} (${commit.msg})`);
                     const files = await getCommitFiles(commit.hash);
                     
-                    // Determine WHY it was skipped based on original inputs
                     const matchedInitialPrefixes = initialPrefixKeys.some(p => commit.msg.startsWith(p));
                     const matchedInitialSuffixes = initialSuffixKeys.some(s => commit.msg.endsWith(s));
                     const matchedInitialRegexes = initialRegexKeys.some(r => {
@@ -248,7 +260,6 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
         ? arr.map(c => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</li>`).join('') 
         : '<li class="empty">None</li>';
 
-    // UI Mapping for Skipped Commits (Includes Badges)
     const mapSkippedCommitList = (arr: any[]) => arr.length > 0 
         ? arr.map(c => {
             const badgeClass = c.reason.includes('Ignored') ? 'badge-ignored' : 'badge-conflict';
@@ -256,7 +267,6 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
         }).join('') 
         : '<li class="empty">None</li>';
 
-    // UI Mapping for Failed Tests (Includes Badges)
     const mapFailedTestList = (arr: any[]) => arr.length > 0 
         ? arr.map(c => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge badge-failed">Validation Failed</span></li>`).join('') 
         : '<li class="empty">None</li>';
@@ -330,13 +340,11 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
                 a.file-link { text-decoration: none; color: #24292e; transition: color 0.2s; }
                 a.file-link:hover { text-decoration: underline; color: #0366d6; }
                 
-                /* Badges Styling */
                 .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; vertical-align: middle; font-family: -apple-system, sans-serif; }
                 .badge-ignored { background: #e1e4e8; color: #586069; }
                 .badge-conflict { background: #ffdce0; color: #b31d28; }
                 .badge-failed { background: #fff5b1; color: #b08800; }
                 
-                /* HTML Details element tweaks */
                 details summary { outline: none; transition: color 0.2s; }
                 details summary:hover { color: #005cc5; }
 
