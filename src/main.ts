@@ -25,11 +25,15 @@ async function getConflictedFiles(): Promise<string[]> {
 
 export async function run(): Promise<void> {
     try {
-        // Use let instead of const so we can dynamically remove bad keys
         let prefixKeys = core.getInput('prefix-keys').split(',').map(k => k.trim()).filter(Boolean);
         let suffixKeys = core.getInput('suffix-keys').split(',').map(k => k.trim()).filter(Boolean);
         let regexKeys = core.getInput('regex-keys').split(',').map(k => k.trim()).filter(Boolean);
         
+        // Save the original inputs so we can tag pruned commits later
+        const initialPrefixKeys = [...prefixKeys];
+        const initialSuffixKeys = [...suffixKeys];
+        const initialRegexKeys = [...regexKeys];
+
         const sourceBranch = core.getInput('source-branch');
         const targetBranch = core.getInput('target-branch');
         const token = core.getInput('github-token');
@@ -62,18 +66,16 @@ export async function run(): Promise<void> {
             const hash = parts.shift()!;
             const date = parts.shift()!;
             const msg = parts.join('|');
-            const shortHash = hash.substring(0, 7);
+            const shortHash = hash.substring(0, 7).toUpperCase(); // UPPERCASE REQUESTED
             return { hash, shortHash, date, msg };
         });
 
         const runUuid = crypto.randomUUID();
         const candidateBranch = `candidate/${runUuid}`;
         
-        // Persist conflicts across all pipeline retries so the report shows everything that failed
         const finalConflicts: any[] = [];
         let finalSummary: any;
 
-        // --- THE SELF-HEALING LOOP ---
         let retryPipeline = true;
 
         while (retryPipeline) {
@@ -84,7 +86,6 @@ export async function run(): Promise<void> {
             core.info(`Starting Pipeline Build. Active Prefixes: [${prefixKeys.join(', ')}]`);
             core.info('========================================');
 
-            // 1. Wipe the branch clean to ensure a completely fresh start
             await exec.exec('git', ['checkout', `origin/${targetBranch}`]);
             try { await exec.exec('git', ['branch', '-D', candidateBranch], { silent: true }); } catch (e) {}
             await exec.exec('git', ['checkout', '-b', candidateBranch, `origin/${targetBranch}`]);
@@ -92,7 +93,6 @@ export async function run(): Promise<void> {
             const summary = { applied: [] as any[], skipped: [] as any[], testFailures: [] as any[] };
 
             for (const commit of commits) {
-                // Find exactly WHICH keys triggered this commit so we can delete them if they break
                 const matchedPrefixes = prefixKeys.filter(p => commit.msg.startsWith(p));
                 const matchedSuffixes = suffixKeys.filter(s => commit.msg.endsWith(s));
                 const matchedRegexes = regexKeys.filter(r => {
@@ -113,41 +113,63 @@ export async function run(): Promise<void> {
                         core.warning(`🚨 Merge conflict on ${commit.shortHash}. Analyzing dependencies and pruning keys...`);
                         
                         const conflictedFiles = await getConflictedFiles();
+                        
+                        const conflictBranch = `conflict-data/${commit.shortHash}-${runUuid}`;
                         await exec.exec('git', ['cherry-pick', '--abort']);
+                        await exec.exec('git', ['checkout', '-b', conflictBranch]);
+                        await exec.exec('git', ['cherry-pick', '-n', commit.hash], { ignoreReturnCode: true });
+                        await exec.exec('git', ['commit', '-am', `Conflict data for ${commit.hash}`], { ignoreReturnCode: true });
+                        await exec.exec('git', ['push', '-u', 'origin', conflictBranch], { ignoreReturnCode: true });
                         
                         const potentialFixes = [];
                         for (const skipped of summary.skipped) {
                             const intersection = skipped.files.filter((f: string) => conflictedFiles.includes(f));
-                            if (intersection.length > 0) potentialFixes.push({...skipped, intersectingFiles: intersection});
+                            const others = skipped.files.filter((f: string) => !conflictedFiles.includes(f));
+                            
+                            if (intersection.length > 0) {
+                                potentialFixes.push({
+                                    ...skipped, 
+                                    intersectingFiles: intersection,
+                                    otherFiles: others // Saving non-intersecting files for the toggle UI
+                                });
+                            }
                         }
 
-                        // Combine all keys that were associated with this broken commit
                         const droppedKeys = [...matchedPrefixes, ...matchedSuffixes, ...matchedRegexes];
 
                         finalConflicts.push({
                             ...commit,
                             files: conflictedFiles,
                             potentialFixes: potentialFixes,
-                            droppedKeys: droppedKeys // Save the pruned keys for the HTML report
+                            droppedKeys: droppedKeys,
+                            conflictBranch: conflictBranch 
                         });
 
-                        // 2. PRUNE THE KEYS FROM THE LISTS
                         prefixKeys = prefixKeys.filter(k => !matchedPrefixes.includes(k));
                         suffixKeys = suffixKeys.filter(k => !matchedSuffixes.includes(k));
                         regexKeys = regexKeys.filter(k => !matchedRegexes.includes(k));
 
                         core.info(`❌ Dropped keys: [${droppedKeys.join(', ')}]. Wiping branch and restarting pipeline...`);
                         
-                        // 3. TRIGGER THE RESTART
                         retryPipeline = true;
-                        break; // Break the commit loop, which forces the while-loop to start over
+                        break; 
                     }
                 } else {
                     core.info(`Skipping commit: ${commit.shortHash} (${commit.msg})`);
                     const files = await getCommitFiles(commit.hash);
-                    summary.skipped.push({ ...commit, files });
+                    
+                    // Determine WHY it was skipped based on original inputs
+                    const matchedInitialPrefixes = initialPrefixKeys.some(p => commit.msg.startsWith(p));
+                    const matchedInitialSuffixes = initialSuffixKeys.some(s => commit.msg.endsWith(s));
+                    const matchedInitialRegexes = initialRegexKeys.some(r => {
+                        try { return new RegExp(r).test(commit.msg); } catch(e) { return false; }
+                    });
+                    
+                    const isPruned = matchedInitialPrefixes || matchedInitialSuffixes || matchedInitialRegexes;
+                    const reason = isPruned ? 'Pruned (Merge Conflict)' : 'Ignored (No Match)';
 
-                    // --- OPTIONAL VALIDATION LOGIC ---
+                    summary.skipped.push({ ...commit, files, reason });
+
                     if (hasPendingChangesToTest && testWorkflowId) {
                         let testPassed = false;
                         core.startGroup(`Automated Validation Loop`);
@@ -171,8 +193,6 @@ export async function run(): Promise<void> {
                                 testPassed = true;
                                 hasPendingChangesToTest = false;
                             } else {
-                                // Note: Currently, a test failure only drops the LAST commit, not the whole ticket.
-                                // It behaves exactly as it did before.
                                 const droppedCommit = summary.applied.pop();
                                 summary.testFailures.push(droppedCommit);
                                 await exec.exec('git', ['reset', '--hard', 'HEAD~1']);
@@ -186,14 +206,13 @@ export async function run(): Promise<void> {
             }
 
             if (!retryPipeline) {
-                finalSummary = summary; // Save the successful run data
+                finalSummary = summary; 
             }
         }
 
         await exec.exec('git', ['push', '-u', 'origin', candidateBranch]);
         core.setOutput('candidate-branch', candidateBranch);
         
-        // Pass finalSummary and finalConflicts to the HTML generator
         await publishSummary(finalSummary, finalConflicts, candidateBranch, runUuid, testWorkflowId);
 
     } catch (error: any) {
@@ -221,10 +240,25 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
     
     const serverUrl = process.env.GITHUB_SERVER_URL || 'https://github.com';
     const repository = process.env.GITHUB_REPOSITORY;
+    
     const commitBaseUrl = `${serverUrl}/${repository}/commit`;
+    const blobBaseUrl = `${serverUrl}/${repository}/blob`;
     
     const mapCommitList = (arr: any[]) => arr.length > 0 
         ? arr.map(c => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</li>`).join('') 
+        : '<li class="empty">None</li>';
+
+    // UI Mapping for Skipped Commits (Includes Badges)
+    const mapSkippedCommitList = (arr: any[]) => arr.length > 0 
+        ? arr.map(c => {
+            const badgeClass = c.reason.includes('Ignored') ? 'badge-ignored' : 'badge-conflict';
+            return `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge ${badgeClass}">${c.reason}</span></li>`;
+        }).join('') 
+        : '<li class="empty">None</li>';
+
+    // UI Mapping for Failed Tests (Includes Badges)
+    const mapFailedTestList = (arr: any[]) => arr.length > 0 
+        ? arr.map(c => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge badge-failed">Validation Failed</span></li>`).join('') 
         : '<li class="empty">None</li>';
 
     const generateConflictGraph = (conflictsArray: any[]) => {
@@ -239,16 +273,33 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
                 </div>
                 <div class="conflict-body">
                     <div class="files-column">
-                        <h4>Conflicted Files</h4>
-                        <ul>${c.files.map((f: string) => `<li>📄 ${f}</li>`).join('')}</ul>
+                        <h4>Conflicted Files (Branch View)</h4>
+                        <ul>${c.files.map((f: string) => `
+                            <li><a href="${blobBaseUrl}/${c.conflictBranch}/${f}" target="_blank" class="file-link">📄 ${f}</a></li>
+                        `).join('')}</ul>
                     </div>
                     <div class="fixes-column">
-                        <h4>Potential Missing Dependencies (Skipped)</h4>
+                        <h4>Potential Missing Dependencies (Commit View)</h4>
                         ${c.potentialFixes.length > 0 ? `
                             <ul>${c.potentialFixes.map((fix: any) => `
                                 <li>
                                     <strong><a href="${commitBaseUrl}/${fix.hash}" target="_blank" class="commit-link"><code>${fix.shortHash}</code></a></strong> ${fix.msg}<br>
-                                    <small>Touched: ${fix.intersectingFiles.join(', ')}</small>
+                                    <div style="margin-top: 6px;">
+                                        <small><strong>Conflicting:</strong> ${fix.intersectingFiles.map((f: string) => `
+                                            <a href="${blobBaseUrl}/${fix.hash}/${f}" target="_blank" class="file-link">${f}</a>
+                                        `).join(', ')}</small>
+                                        
+                                        ${fix.otherFiles.length > 0 ? `
+                                            <details style="margin-top: 6px; cursor: pointer;">
+                                                <summary style="color: #0366d6; font-size: 11px; font-family: monospace;">Show ${fix.otherFiles.length} other files touched</summary>
+                                                <div style="padding-left: 10px; margin-top: 4px;">
+                                                    <small>${fix.otherFiles.map((f: string) => `
+                                                        <a href="${blobBaseUrl}/${fix.hash}/${f}" target="_blank" class="file-link">${f}</a>
+                                                    `).join('<br>')}</small>
+                                                </div>
+                                            </details>
+                                        ` : ''}
+                                    </div>
                                 </li>
                             `).join('')}</ul>
                         ` : `<p class="empty">No skipped commits touched these files.</p>`}
@@ -269,13 +320,26 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
                 h1 { border-bottom: 2px solid #eaecef; padding-bottom: .3em; }
                 h2 { color: #0366d6; }
                 ul { background: #f6f8fa; padding: 15px 40px; border-radius: 6px; }
-                li { margin-bottom: 5px; font-family: monospace; font-size: 14px; }
+                li { margin-bottom: 8px; font-family: monospace; font-size: 14px; }
                 .empty { color: #586069; font-style: italic; list-style-type: none; }
                 
                 a.commit-link { text-decoration: none; }
                 a.commit-link code { color: #0366d6; cursor: pointer; }
                 a.commit-link:hover code { text-decoration: underline; color: #005cc5; }
                 
+                a.file-link { text-decoration: none; color: #24292e; transition: color 0.2s; }
+                a.file-link:hover { text-decoration: underline; color: #0366d6; }
+                
+                /* Badges Styling */
+                .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; vertical-align: middle; font-family: -apple-system, sans-serif; }
+                .badge-ignored { background: #e1e4e8; color: #586069; }
+                .badge-conflict { background: #ffdce0; color: #b31d28; }
+                .badge-failed { background: #fff5b1; color: #b08800; }
+                
+                /* HTML Details element tweaks */
+                details summary { outline: none; transition: color 0.2s; }
+                details summary:hover { color: #005cc5; }
+
                 .conflict-card { border: 1px solid #d73a49; border-radius: 6px; margin: 15px 0 15px 40px; overflow: hidden; }
                 .commit-header { background: #ffeef0; padding: 10px 15px; border-bottom: 1px solid #d73a49; color: #b31d28; font-family: monospace;}
                 .commit-header a.commit-link code { color: #b31d28; text-decoration: underline; }
@@ -297,17 +361,16 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
             <ul>${mapCommitList(summary.applied)}</ul>
             
             <h3>⏭️ Skipped Commits</h3>
-            <ul>${mapCommitList(summary.skipped)}</ul>
+            <ul>${mapSkippedCommitList(summary.skipped)}</ul>
             
             <h3>⚠️ Invalidated Tickets (Merge Conflicts)</h3>
             ${generateConflictGraph(conflicts)}
             
             <h3>❌ Dropped due to Failed Validation Tests${testingStatus}</h3>
-            <ul>${mapCommitList(summary.testFailures)}</ul>
+            <ul>${mapFailedTestList(summary.testFailures)}</ul>
         </body>
     </html>`;
 
-    // --- NEW: Bulletproof Remote Check ---
     let lsRemoteOutput = '';
     await exec.exec('git', ['ls-remote', '--heads', 'origin', 'gh-pages'], {
         listeners: { stdout: (data: Buffer) => lsRemoteOutput += data.toString() },
@@ -319,10 +382,7 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
     if (hasRemoteGhPages) {
         core.info('Remote gh-pages branch found. Syncing...');
         await exec.exec('git', ['fetch', 'origin', 'gh-pages']);
-        
-        // Force delete local gh-pages if it accidentally exists to avoid checkout crashes
         try { await exec.exec('git', ['branch', '-D', 'gh-pages'], { silent: true }); } catch (e) {}
-        
         await exec.exec('git', ['checkout', '-b', 'gh-pages', 'origin/gh-pages']);
     } else {
         core.info('Remote gh-pages branch not found. Creating a new orphan branch...');
@@ -330,7 +390,6 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
         await exec.exec('git', ['rm', '-rf', '.']);
     }
 
-    // Write the files ONLY AFTER we are safely on the gh-pages branch
     fs.writeFileSync('index.html', html);
     fs.writeFileSync(`report-${runUuid}.html`, html);
     
@@ -338,6 +397,5 @@ async function publishSummary(summary: any, conflicts: any[], candidateBranch: s
     await exec.exec('git', ['commit', '-m', `Add automation report for ${candidateBranch}`]);
     await exec.exec('git', ['push', 'origin', 'gh-pages']);
 
-    // Return the workspace back to the candidate branch
     await exec.exec('git', ['checkout', candidateBranch]);
 }

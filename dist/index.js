@@ -24549,6 +24549,9 @@ async function run() {
     let prefixKeys = getInput("prefix-keys").split(",").map((k) => k.trim()).filter(Boolean);
     let suffixKeys = getInput("suffix-keys").split(",").map((k) => k.trim()).filter(Boolean);
     let regexKeys = getInput("regex-keys").split(",").map((k) => k.trim()).filter(Boolean);
+    const initialPrefixKeys = [...prefixKeys];
+    const initialSuffixKeys = [...suffixKeys];
+    const initialRegexKeys = [...regexKeys];
     const sourceBranch = getInput("source-branch");
     const targetBranch = getInput("target-branch");
     const token = getInput("github-token");
@@ -24575,7 +24578,7 @@ async function run() {
       const hash = parts.shift();
       const date = parts.shift();
       const msg = parts.join("|");
-      const shortHash = hash.substring(0, 7);
+      const shortHash = hash.substring(0, 7).toUpperCase();
       return { hash, shortHash, date, msg };
     });
     const runUuid = crypto2.randomUUID();
@@ -24617,19 +24620,32 @@ async function run() {
           } catch (error2) {
             warning(`\u{1F6A8} Merge conflict on ${commit.shortHash}. Analyzing dependencies and pruning keys...`);
             const conflictedFiles = await getConflictedFiles();
+            const conflictBranch = `conflict-data/${commit.shortHash}-${runUuid}`;
             await exec("git", ["cherry-pick", "--abort"]);
+            await exec("git", ["checkout", "-b", conflictBranch]);
+            await exec("git", ["cherry-pick", "-n", commit.hash], { ignoreReturnCode: true });
+            await exec("git", ["commit", "-am", `Conflict data for ${commit.hash}`], { ignoreReturnCode: true });
+            await exec("git", ["push", "-u", "origin", conflictBranch], { ignoreReturnCode: true });
             const potentialFixes = [];
             for (const skipped of summary2.skipped) {
               const intersection = skipped.files.filter((f) => conflictedFiles.includes(f));
-              if (intersection.length > 0) potentialFixes.push({ ...skipped, intersectingFiles: intersection });
+              const others = skipped.files.filter((f) => !conflictedFiles.includes(f));
+              if (intersection.length > 0) {
+                potentialFixes.push({
+                  ...skipped,
+                  intersectingFiles: intersection,
+                  otherFiles: others
+                  // Saving non-intersecting files for the toggle UI
+                });
+              }
             }
             const droppedKeys = [...matchedPrefixes, ...matchedSuffixes, ...matchedRegexes];
             finalConflicts.push({
               ...commit,
               files: conflictedFiles,
               potentialFixes,
-              droppedKeys
-              // Save the pruned keys for the HTML report
+              droppedKeys,
+              conflictBranch
             });
             prefixKeys = prefixKeys.filter((k) => !matchedPrefixes.includes(k));
             suffixKeys = suffixKeys.filter((k) => !matchedSuffixes.includes(k));
@@ -24641,7 +24657,18 @@ async function run() {
         } else {
           info(`Skipping commit: ${commit.shortHash} (${commit.msg})`);
           const files = await getCommitFiles(commit.hash);
-          summary2.skipped.push({ ...commit, files });
+          const matchedInitialPrefixes = initialPrefixKeys.some((p) => commit.msg.startsWith(p));
+          const matchedInitialSuffixes = initialSuffixKeys.some((s) => commit.msg.endsWith(s));
+          const matchedInitialRegexes = initialRegexKeys.some((r) => {
+            try {
+              return new RegExp(r).test(commit.msg);
+            } catch (e) {
+              return false;
+            }
+          });
+          const isPruned = matchedInitialPrefixes || matchedInitialSuffixes || matchedInitialRegexes;
+          const reason = isPruned ? "Pruned (Merge Conflict)" : "Ignored (No Match)";
+          summary2.skipped.push({ ...commit, files, reason });
           if (hasPendingChangesToTest && testWorkflowId) {
             let testPassed = false;
             startGroup(`Automated Validation Loop`);
@@ -24706,7 +24733,13 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
   const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
   const repository = process.env.GITHUB_REPOSITORY;
   const commitBaseUrl = `${serverUrl}/${repository}/commit`;
+  const blobBaseUrl = `${serverUrl}/${repository}/blob`;
   const mapCommitList = (arr) => arr.length > 0 ? arr.map((c) => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</li>`).join("") : '<li class="empty">None</li>';
+  const mapSkippedCommitList = (arr) => arr.length > 0 ? arr.map((c) => {
+    const badgeClass = c.reason.includes("Ignored") ? "badge-ignored" : "badge-conflict";
+    return `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge ${badgeClass}">${c.reason}</span></li>`;
+  }).join("") : '<li class="empty">None</li>';
+  const mapFailedTestList = (arr) => arr.length > 0 ? arr.map((c) => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge badge-failed">Validation Failed</span></li>`).join("") : '<li class="empty">None</li>';
   const generateConflictGraph = (conflictsArray) => {
     if (conflictsArray.length === 0) return '<p class="empty" style="margin-left: 40px;">None</p>';
     return conflictsArray.map((c) => `
@@ -24718,16 +24751,33 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 </div>
                 <div class="conflict-body">
                     <div class="files-column">
-                        <h4>Conflicted Files</h4>
-                        <ul>${c.files.map((f) => `<li>\u{1F4C4} ${f}</li>`).join("")}</ul>
+                        <h4>Conflicted Files (Branch View)</h4>
+                        <ul>${c.files.map((f) => `
+                            <li><a href="${blobBaseUrl}/${c.conflictBranch}/${f}" target="_blank" class="file-link">\u{1F4C4} ${f}</a></li>
+                        `).join("")}</ul>
                     </div>
                     <div class="fixes-column">
-                        <h4>Potential Missing Dependencies (Skipped)</h4>
+                        <h4>Potential Missing Dependencies (Commit View)</h4>
                         ${c.potentialFixes.length > 0 ? `
                             <ul>${c.potentialFixes.map((fix) => `
                                 <li>
                                     <strong><a href="${commitBaseUrl}/${fix.hash}" target="_blank" class="commit-link"><code>${fix.shortHash}</code></a></strong> ${fix.msg}<br>
-                                    <small>Touched: ${fix.intersectingFiles.join(", ")}</small>
+                                    <div style="margin-top: 6px;">
+                                        <small><strong>Conflicting:</strong> ${fix.intersectingFiles.map((f) => `
+                                            <a href="${blobBaseUrl}/${fix.hash}/${f}" target="_blank" class="file-link">${f}</a>
+                                        `).join(", ")}</small>
+                                        
+                                        ${fix.otherFiles.length > 0 ? `
+                                            <details style="margin-top: 6px; cursor: pointer;">
+                                                <summary style="color: #0366d6; font-size: 11px; font-family: monospace;">Show ${fix.otherFiles.length} other files touched</summary>
+                                                <div style="padding-left: 10px; margin-top: 4px;">
+                                                    <small>${fix.otherFiles.map((f) => `
+                                                        <a href="${blobBaseUrl}/${fix.hash}/${f}" target="_blank" class="file-link">${f}</a>
+                                                    `).join("<br>")}</small>
+                                                </div>
+                                            </details>
+                                        ` : ""}
+                                    </div>
                                 </li>
                             `).join("")}</ul>
                         ` : `<p class="empty">No skipped commits touched these files.</p>`}
@@ -24747,13 +24797,26 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 h1 { border-bottom: 2px solid #eaecef; padding-bottom: .3em; }
                 h2 { color: #0366d6; }
                 ul { background: #f6f8fa; padding: 15px 40px; border-radius: 6px; }
-                li { margin-bottom: 5px; font-family: monospace; font-size: 14px; }
+                li { margin-bottom: 8px; font-family: monospace; font-size: 14px; }
                 .empty { color: #586069; font-style: italic; list-style-type: none; }
                 
                 a.commit-link { text-decoration: none; }
                 a.commit-link code { color: #0366d6; cursor: pointer; }
                 a.commit-link:hover code { text-decoration: underline; color: #005cc5; }
                 
+                a.file-link { text-decoration: none; color: #24292e; transition: color 0.2s; }
+                a.file-link:hover { text-decoration: underline; color: #0366d6; }
+                
+                /* Badges Styling */
+                .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; margin-left: 8px; vertical-align: middle; font-family: -apple-system, sans-serif; }
+                .badge-ignored { background: #e1e4e8; color: #586069; }
+                .badge-conflict { background: #ffdce0; color: #b31d28; }
+                .badge-failed { background: #fff5b1; color: #b08800; }
+                
+                /* HTML Details element tweaks */
+                details summary { outline: none; transition: color 0.2s; }
+                details summary:hover { color: #005cc5; }
+
                 .conflict-card { border: 1px solid #d73a49; border-radius: 6px; margin: 15px 0 15px 40px; overflow: hidden; }
                 .commit-header { background: #ffeef0; padding: 10px 15px; border-bottom: 1px solid #d73a49; color: #b31d28; font-family: monospace;}
                 .commit-header a.commit-link code { color: #b31d28; text-decoration: underline; }
@@ -24775,13 +24838,13 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
             <ul>${mapCommitList(summary2.applied)}</ul>
             
             <h3>\u23ED\uFE0F Skipped Commits</h3>
-            <ul>${mapCommitList(summary2.skipped)}</ul>
+            <ul>${mapSkippedCommitList(summary2.skipped)}</ul>
             
             <h3>\u26A0\uFE0F Invalidated Tickets (Merge Conflicts)</h3>
             ${generateConflictGraph(conflicts)}
             
             <h3>\u274C Dropped due to Failed Validation Tests${testingStatus}</h3>
-            <ul>${mapCommitList(summary2.testFailures)}</ul>
+            <ul>${mapFailedTestList(summary2.testFailures)}</ul>
         </body>
     </html>`;
   let lsRemoteOutput = "";
