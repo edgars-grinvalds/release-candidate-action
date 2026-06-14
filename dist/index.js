@@ -24737,17 +24737,18 @@ async function pollWorkflowRun(octokit, owner, repo, workflowId, branch) {
   }
 }
 async function publishSummary(summary2, conflicts, candidateBranch, runUuid, testWorkflowId) {
-  const testingStatus = testWorkflowId ? "" : " <i>(Testing Disabled)</i>";
   const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
   const repository = process.env.GITHUB_REPOSITORY;
   const commitBaseUrl = `${serverUrl}/${repository}/commit`;
   const blobBaseUrl = `${serverUrl}/${repository}/blob`;
-  const mapCommitList = (arr) => arr.length > 0 ? arr.map((c) => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</li>`).join("") : '<li class="empty">None</li>';
+  const mapCommitList = (arr) => arr.length > 0 ? arr.map((c) => `<div class="commit-item"><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg}</div>`).join("") : '<div class="empty">None</div>';
   const mapSkippedCommitList = (arr) => arr.length > 0 ? arr.map((c) => {
     const badgeClass = c.reason.includes("Ignored") ? "badge-ignored" : "badge-conflict";
-    return `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge ${badgeClass}">${c.reason}</span></li>`;
-  }).join("") : '<li class="empty">None</li>';
-  const mapFailedTestList = (arr) => arr.length > 0 ? arr.map((c) => `<li><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge badge-failed">Validation Failed</span></li>`).join("") : '<li class="empty">None</li>';
+    return `<div class="commit-item"><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge ${badgeClass}">${c.reason}</span></div>`;
+  }).join("") : '<div class="empty">None</div>';
+  const mapFailedTestList = (arr) => arr.length > 0 ? arr.map((c) => `<div class="commit-item"><a href="${commitBaseUrl}/${c.hash}" target="_blank" class="commit-link"><code>${c.shortHash}</code></a> ${c.msg} <span class="badge badge-failed">Validation Failed</span></div>`).join("") : '<div class="empty">None</div>';
+  const failedTestsSection = testWorkflowId ? `<h3>\u274C Dropped due to Failed Validation Tests</h3>
+           <div class="commit-list">${mapFailedTestList(summary2.testFailures)}</div>` : "";
   const generateConflictGraph = (conflictsArray) => {
     if (conflictsArray.length === 0) return '<p class="empty" style="margin-left: 40px;">None</p>';
     return conflictsArray.map((c) => `
@@ -24760,15 +24761,15 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 <div class="conflict-body">
                     <div class="files-column">
                         <h4>Conflicted Files (Branch View)</h4>
-                        <ul>${c.files.map((f) => `
-                            <li><a href="${blobBaseUrl}/${c.conflictBranch}/${f}" target="_blank" class="file-link">\u{1F4C4} ${f}</a></li>
-                        `).join("")}</ul>
+                        <div class="conflict-items">${c.files.map((f) => `
+                            <div class="commit-item"><a href="${blobBaseUrl}/${c.conflictBranch}/${f}" target="_blank" class="file-link">\u{1F4C4} ${f}</a></div>
+                        `).join("")}</div>
                     </div>
                     <div class="fixes-column">
                         <h4>Potential Missing Dependencies (Commit View)</h4>
                         ${c.potentialFixes.length > 0 ? `
-                            <ul>${c.potentialFixes.map((fix) => `
-                                <li>
+                            <div class="conflict-items">${c.potentialFixes.map((fix) => `
+                                <div class="commit-item" style="margin-bottom: 12px;">
                                     <strong><a href="${commitBaseUrl}/${fix.hash}" target="_blank" class="commit-link"><code>${fix.shortHash}</code></a></strong> ${fix.msg}<br>
                                     <div style="margin-top: 6px;">
                                         <small><strong>Conflicting:</strong> ${fix.intersectingFiles.map((f) => `
@@ -24786,8 +24787,8 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                                             </details>
                                         ` : ""}
                                     </div>
-                                </li>
-                            `).join("")}</ul>
+                                </div>
+                            `).join("")}</div>
                         ` : `<p class="empty">No skipped commits touched these files.</p>`}
                     </div>
                 </div>
@@ -24804,9 +24805,11 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 900px; margin: 40px auto; padding: 0 20px; color: #333; }
                 h1 { border-bottom: 2px solid #eaecef; padding-bottom: .3em; }
                 h2 { color: #0366d6; }
-                ul { background: #f6f8fa; padding: 15px 40px; border-radius: 6px; }
-                li { margin-bottom: 8px; font-family: monospace; font-size: 14px; }
-                .empty { color: #586069; font-style: italic; list-style-type: none; }
+                
+                /* List Styles */
+                .commit-list { background: #f6f8fa; padding: 15px 20px; border-radius: 6px; }
+                .commit-item { margin-bottom: 8px; font-family: monospace; font-size: 14px; }
+                .empty { color: #586069; font-style: italic; }
                 
                 a.commit-link { text-decoration: none; }
                 a.commit-link code { color: #0366d6; cursor: pointer; }
@@ -24823,7 +24826,8 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 details summary { outline: none; transition: color 0.2s; }
                 details summary:hover { color: #005cc5; }
 
-                .conflict-card { border: 1px solid #d73a49; border-radius: 6px; margin: 15px 0 15px 40px; overflow: hidden; }
+                /* Conflict Graph Styles */
+                .conflict-card { border: 1px solid #d73a49; border-radius: 6px; margin: 15px 0 15px 0; overflow: hidden; }
                 .commit-header { background: #ffeef0; padding: 10px 15px; border-bottom: 1px solid #d73a49; color: #b31d28; font-family: monospace;}
                 .commit-header a.commit-link code { color: #b31d28; text-decoration: underline; }
                 .conflict-body { display: flex; background: #fff; }
@@ -24831,8 +24835,7 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
                 .files-column { border-right: 1px solid #eaecef; background: #fdf8f8; }
                 .fixes-column { background: #f1f8ff; }
                 .conflict-card h4 { margin-top: 0; font-size: 13px; text-transform: uppercase; color: #586069; border-bottom: 1px solid #eaecef; padding-bottom: 5px;}
-                .conflict-card ul { background: transparent; padding-left: 20px; margin: 0; }
-                .conflict-card li { font-family: -apple-system, sans-serif; font-size: 13px; margin-bottom: 10px; }
+                .conflict-items { padding-left: 0; margin: 0; }
                 .conflict-card small { display: block; color: #586069; margin-top: 2px; font-family: monospace; font-size: 11px;}
             </style>
         </head>
@@ -24841,16 +24844,15 @@ async function publishSummary(summary2, conflicts, candidateBranch, runUuid, tes
             <h2>Candidate Branch: <code>${candidateBranch}</code></h2>
             
             <h3>\u2705 Applied Commits (${summary2.applied.length})</h3>
-            <ul>${mapCommitList(summary2.applied)}</ul>
+            <div class="commit-list">${mapCommitList(summary2.applied)}</div>
             
             <h3>\u23ED\uFE0F Skipped Commits</h3>
-            <ul>${mapSkippedCommitList(summary2.skipped)}</ul>
+            <div class="commit-list">${mapSkippedCommitList(summary2.skipped)}</div>
             
             <h3>\u26A0\uFE0F Invalidated Tickets (Merge Conflicts)</h3>
             ${generateConflictGraph(conflicts)}
             
-            <h3>\u274C Dropped due to Failed Validation Tests${testingStatus}</h3>
-            <ul>${mapFailedTestList(summary2.testFailures)}</ul>
+            ${failedTestsSection}
         </body>
     </html>`;
   let lsRemoteOutput = "";
